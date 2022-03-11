@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
@@ -72,6 +73,7 @@ def ensure_audio_length(in_file, out_file, length):
 
 
 def silence_gen(out_file, duration):
+    logging.debug(f"Generating {out_file}...")
     process = subprocess.call(
         [
             "ffmpeg",
@@ -79,7 +81,9 @@ def silence_gen(out_file, duration):
             "-f",
             "lavfi",
             "-i",
-            f"anullsrc=cl=mono:d={duration}:r=24000",
+            f"anullsrc=cl=mono:r=24000",
+            "-t",
+            str(duration),
             out_file,
         ],
         stdout=subprocess.DEVNULL,
@@ -87,6 +91,34 @@ def silence_gen(out_file, duration):
     )
     if process != 0:
         raise Exception("ffmpeg failed")
+    logging.debug(f"Generated {out_file}")
+
+
+async def audio_gen(
+    fname, communicate, text, pitch, rate, volume, voice_name, duration
+):
+    with open(fname, "wb") as f:
+        logging.debug(f"Generating {fname}...")
+        async for j in communicate.run(
+            " ".join(text.split("\n")),
+            codec="audio-24khz-48kbitrate-mono-mp3",
+            pitch=pitch,
+            rate=rate,
+            volume=volume,
+            voice=voice_name,
+        ):
+            if j[2] is not None:
+                f.write(j[2])
+
+        temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        try:
+            ensure_audio_length(fname, temporary_file.name, duration)
+        finally:
+            temporary_file.close()
+            shutil.move(temporary_file.name, fname)
+            temporary_file = None
+
+    logging.debug(f"Generated {fname}")
 
 
 async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
@@ -98,8 +130,9 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
     input_files_start_end = {}
 
     with tempfile.TemporaryDirectory() as temp_dir:
+        coros = []
         for i in range(len(srt_data)):
-            print(f"Processing {i}...")
+            logging.debug(f"Preparing {i}...")
 
             fname = os.path.join(temp_dir, f"{i}.mp3")
             input_files.append(fname)
@@ -110,28 +143,21 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
             input_files_start_end[fname] = (start, end)
 
             duration = pysrttime_to_seconds(srt_data[i].duration)
-
-            with open(fname, "wb") as f:
-                async for j in communicate.run(
-                    srt_data[i].text,
-                    codec="audio-24khz-48kbitrate-mono-mp3",
+            coros.append(
+                audio_gen(
+                    fname=fname,
+                    communicate=communicate,
+                    text=srt_data[i].text,
                     pitch=pitch,
                     rate=rate,
                     volume=volume,
-                    voice=voice_name,
-                ):
-                    if j[2] is not None:
-                        f.write(j[2])
-
-                temporary_file = tempfile.NamedTemporaryFile(
-                    suffix=".mp3", delete=False
+                    voice_name=voice_name,
+                    duration=duration,
                 )
-                try:
-                    ensure_audio_length(fname, temporary_file.name, duration)
-                finally:
-                    temporary_file.close()
-                    shutil.move(temporary_file.name, fname)
-                    temporary_file = None
+            )
+        coros_len = len(coros)
+        for i in range(0, coros_len, 10):
+            await asyncio.gather(*coros[i : i + 10])
 
         print("Joining...")
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as f:
@@ -139,12 +165,14 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
             for i in range(len(input_files)):
                 start = input_files_start_end[input_files[i]][0]
                 needed = start - last_end
+                logging.debug(f"Needed {needed} seconds for {i}")
                 if needed > 0:
                     sfname = os.path.join(temp_dir, f"silence_{i}.mp3")
                     silence_gen(sfname, needed)
                     f.write(f"file '{sfname}'\n")
+                    last_end += needed
                 f.write(f"file '{input_files[i]}'\n")
-                last_end = input_files_start_end[input_files[i]][1]
+                last_end += get_duration(input_files[i])
 
             x = get_duration(input_files[-1])
             y = input_files_start_end[input_files[i]][0] + x
@@ -185,6 +213,7 @@ def main():
     parser.add_argument("--default-speed", help="default speed", default="+0%")
     parser.add_argument("--default-pitch", help="default pitch", default="+0Hz")
     parser.add_argument("--default-volume", help="default volume", default="+0%")
+    parser.add_argument("--disable-debug", help="disable debug", action="store_true")
     args = parser.parse_args()
 
     srt_data = parse_srt(args.srt_file)
@@ -193,6 +222,9 @@ def main():
     speed = args.default_speed
     pitch = args.default_pitch
     volume = args.default_volume
+
+    if not args.disable_debug:
+        logging.basicConfig(level=logging.DEBUG)
 
     asyncio.get_event_loop().run_until_complete(
         _main(
