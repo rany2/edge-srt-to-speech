@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import random
 import shutil
 import subprocess
 import tempfile
@@ -108,7 +109,7 @@ async def audio_gen(
                 rate=rate,
                 volume=volume,
                 voice=voice_name,
-                boundary_type=2,  # must be set to generate for strings >2 chars
+                boundary_type=1,
             ):
                 if j[2] is not None:
                     f.write(j[2])
@@ -118,6 +119,7 @@ async def audio_gen(
                 else:
                     retry_count += 1
                     logging.debug(f"Retrying {fname}...")
+                    await asyncio.sleep(retry_count + random.randint(1, 5))
             else:
                 break
 
