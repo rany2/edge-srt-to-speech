@@ -156,21 +156,21 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
                 )
             )
         coros_len = len(coros)
-        for i in range(0, coros_len, 10):
-            await asyncio.gather(*coros[i : i + 10])
+        for i in range(0, coros_len, 100):
+            await asyncio.gather(*coros[i : i + 100])
 
-        print("Joining...")
+        logging.debug("Generating silence and joining...")
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as f:
             last_end = 0
             for i in range(len(input_files)):
                 start = input_files_start_end[input_files[i]][0]
                 needed = start - last_end
                 logging.debug(f"Needed {needed} seconds for {i}")
-                if needed > 0:
+                if needed > 0.0001:
                     sfname = os.path.join(temp_dir, f"silence_{i}.mp3")
                     silence_gen(sfname, needed)
                     f.write(f"file '{sfname}'\n")
-                    last_end += needed
+                    last_end += get_duration(sfname)
                 f.write(f"file '{input_files[i]}'\n")
                 last_end += get_duration(input_files[i])
 
@@ -202,7 +202,7 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
             )
             if process != 0:
                 raise Exception("ffmpeg failed")
-    print("Done")
+    logging.debug(f"Completed {out_file}")
 
 
 def main():
