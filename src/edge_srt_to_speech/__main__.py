@@ -131,7 +131,7 @@ async def audio_gen(
     logging.debug(f"Generated {fname}")
 
 
-async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
+async def _main(srt_data, voice_name, out_file, pitch, rate, volume, batch_size):
     communicate = edge_tts.Communicate()
 
     max_duration = pysrttime_to_seconds(srt_data[-1].end)
@@ -166,8 +166,8 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
                 )
             )
         coros_len = len(coros)
-        for i in range(0, coros_len, 500):
-            await asyncio.gather(*coros[i : i + 500])
+        for i in range(0, coros_len, batch_size):
+            await asyncio.gather(*coros[i : i + batch_size])
 
         logging.debug("Generating silence and joining...")
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as f:
@@ -220,6 +220,7 @@ def main():
     parser.add_argument("srt_file", help="srt file to convert")
     parser.add_argument("out_file", help="output file")
     parser.add_argument("--voice", help="voice name", default="en-US-SaraNeural")
+    parser.add_argument("--parallel-batch-size", help="request batch size", default=100)
     parser.add_argument("--default-speed", help="default speed", default="+0%")
     parser.add_argument("--default-pitch", help="default pitch", default="+0Hz")
     parser.add_argument("--default-volume", help="default volume", default="+0%")
@@ -232,6 +233,9 @@ def main():
     speed = args.default_speed
     pitch = args.default_pitch
     volume = args.default_volume
+    batch_size = int(args.parallel_batch_size)
+    if batch_size < 1:
+        raise Exception("parallel-batch-size must be greater than 0")
 
     if not args.disable_debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -244,6 +248,7 @@ def main():
             rate=speed,
             pitch=pitch,
             volume=volume,
+            batch_size=batch_size,
         )
     )
 
