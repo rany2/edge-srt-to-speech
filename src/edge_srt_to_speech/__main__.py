@@ -97,26 +97,36 @@ def silence_gen(out_file, duration):
 async def audio_gen(
     fname, communicate, text, pitch, rate, volume, voice_name, duration
 ):
+    retry_count = 0
     with open(fname, "wb") as f:
-        logging.debug(f"Generating {fname}...")
-        async for j in communicate.run(
-            " ".join(text.split("\n")),
-            codec="audio-24khz-48kbitrate-mono-mp3",
-            pitch=pitch,
-            rate=rate,
-            volume=volume,
-            voice=voice_name,
-        ):
-            if j[2] is not None:
-                f.write(j[2])
+        while True:
+            logging.debug(f"Generating {fname}...")
+            async for j in communicate.run(
+                " ".join(text.split("\n")),
+                codec="audio-24khz-48kbitrate-mono-mp3",
+                pitch=pitch,
+                rate=rate,
+                volume=volume,
+                voice=voice_name,
+                boundary_type=2,  # must be set to generate for strings >2 chars
+            ):
+                if j[2] is not None:
+                    f.write(j[2])
+            if f.tell() == 0:
+                if retry_count > 5:
+                    raise Exception(f"Too many retries for {fname}")
+                else:
+                    retry_count += 1
+                    logging.debug(f"Retrying {fname}...")
+            else:
+                break
 
-        temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-        try:
-            ensure_audio_length(fname, temporary_file.name, duration)
-        finally:
-            temporary_file.close()
-            shutil.move(temporary_file.name, fname)
-            temporary_file = None
+    temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    try:
+        ensure_audio_length(fname, temporary_file.name, duration)
+    finally:
+        temporary_file.close()
+        shutil.move(temporary_file.name, fname)
 
     logging.debug(f"Generated {fname}")
 
@@ -156,8 +166,8 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
                 )
             )
         coros_len = len(coros)
-        for i in range(0, coros_len, 100):
-            await asyncio.gather(*coros[i : i + 100])
+        for i in range(0, coros_len, 500):
+            await asyncio.gather(*coros[i : i + 500])
 
         logging.debug("Generating silence and joining...")
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as f:
