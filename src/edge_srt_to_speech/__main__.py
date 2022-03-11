@@ -5,10 +5,10 @@ import asyncio
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 
 import edge_tts
+import pysrt
 
 if shutil.which("ffmpeg") is None:
     print("ffmpeg is not installed")
@@ -20,15 +20,15 @@ if shutil.which("ffprobe") is None:
 
 
 def parse_srt(srt_file):
-    with open(srt_file, "r", encoding="utf-8") as f:
-        data = f.read().strip().split("\n\n")
-    data = [i.strip() for i in data]
-    data = [(*i.split("\n")[:2], " ".join(i.split("\n")[2:])) for i in data]
-    data = sorted(data, key=lambda x: int(x[0]))
-    return data
+    subs = pysrt.open(srt_file)
+    return subs
 
 
-def ensure_audio_length(in_file, out_file, length):
+def pysrttime_to_seconds(t):
+    return (t.hours * 60 + t.minutes) * 60 + t.seconds + t.milliseconds / 1000
+
+
+def get_duration(in_file):
     duration = subprocess.check_output(
         [
             "ffprobe",
@@ -41,7 +41,11 @@ def ensure_audio_length(in_file, out_file, length):
             in_file,
         ]
     ).decode("utf-8")
-    duration = float(duration)
+    return float(duration)
+
+
+def ensure_audio_length(in_file, out_file, length):
+    duration = get_duration(in_file)
     atempo = duration / length
     if atempo < 0.5:
         atempo = 0.5
@@ -67,120 +71,109 @@ def ensure_audio_length(in_file, out_file, length):
         shutil.copyfile(in_file, out_file)
 
 
+def silence_gen(out_file, duration):
+    process = subprocess.call(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=cl=mono:d={duration}:r=24000",
+            out_file,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if process != 0:
+        raise Exception("ffmpeg failed")
+
+
 async def _main(srt_data, voice_name, out_file, pitch, rate, volume):
     communicate = edge_tts.Communicate()
 
-    max_duration = srt_data[-1][1].replace(",", ".").split("-->")[1]
-    max_duration = max_duration.split(":")
-    max_duration = (
-        float(max_duration[0]) * 3600
-        + float(max_duration[1]) * 60
-        + float(max_duration[2])
-    )
-    mother_temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    try:
-        process = subprocess.call(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "anullsrc=channel_layout=mono:sample_rate=48000",
-                "-t",
-                str(max_duration),
-                mother_temp_file.name,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if process != 0:
-            raise Exception("ffmpeg failed")
+    max_duration = pysrttime_to_seconds(srt_data[-1].end)
 
-        input_files = []
-        input_files_start = {}
+    input_files = []
+    input_files_start_end = {}
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for i in srt_data:
-                print(f"Processing {i[0]}...")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for i in range(len(srt_data)):
+            print(f"Processing {i}...")
 
-                fname = os.path.join(temp_dir, f"{i[0]}.mp3")
-                input_files.append(fname)
+            fname = os.path.join(temp_dir, f"{i}.mp3")
+            input_files.append(fname)
 
-                duration = i[1].replace(",", ".")
-                duration = duration.split("-->")
+            start = pysrttime_to_seconds(srt_data[i].start)
+            end = pysrttime_to_seconds(srt_data[i].end)
 
-                start = duration[0].split(":")
-                start = int(start[0]) * 3600 + int(start[1]) * 60 + float(start[2])
-                input_files_start[fname] = start
+            input_files_start_end[fname] = (start, end)
 
-                end = duration[1].split(":")
-                end = int(end[0]) * 3600 + int(end[1]) * 60 + float(end[2])
+            duration = pysrttime_to_seconds(srt_data[i].duration)
 
-                duration = end - start
-                with open(fname, "wb") as f:
-                    async for j in communicate.run(
-                        i[2],
-                        codec="audio-24khz-48kbitrate-mono-mp3",
-                        pitch=pitch,
-                        rate=rate,
-                        volume=volume,
-                        voice=voice_name,
-                    ):
-                        if j[2] is not None:
-                            f.write(j[2])
+            with open(fname, "wb") as f:
+                async for j in communicate.run(
+                    srt_data[i].text,
+                    codec="audio-24khz-48kbitrate-mono-mp3",
+                    pitch=pitch,
+                    rate=rate,
+                    volume=volume,
+                    voice=voice_name,
+                ):
+                    if j[2] is not None:
+                        f.write(j[2])
 
-                    temporary_file = tempfile.NamedTemporaryFile(
-                        suffix=".mp3", delete=False
-                    )
-                    try:
-                        ensure_audio_length(fname, temporary_file.name, duration)
-                    finally:
-                        temporary_file.close()
-                        shutil.move(temporary_file.name, fname)
-                        temporary_file = None
-
-            ffmpeg_opts = []
-            for i in range(len(input_files)):
-                ffmpeg_opts.append("-i")
-                ffmpeg_opts.append(input_files[i])
-
-            filter_complex = ""
-            for i in range(len(input_files)):
-                filter_complex += (
-                    f"aevalsrc=0:d={input_files_start[input_files[i]]}[s{i+1}];"
+                temporary_file = tempfile.NamedTemporaryFile(
+                    suffix=".mp3", delete=False
                 )
-                filter_complex += f"[s{i+1}][{i+1}:a]concat=n=2:v=0:a=1[ac{i+1}];"
+                try:
+                    ensure_audio_length(fname, temporary_file.name, duration)
+                finally:
+                    temporary_file.close()
+                    shutil.move(temporary_file.name, fname)
+                    temporary_file = None
 
-            filter_complex += f"[0:a]"
+        print("Joining...")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as f:
+            last_end = 0
             for i in range(len(input_files)):
-                filter_complex += f"[ac{i+1}]"
-            filter_complex += f"amix={len(input_files)+1}[aout]"
+                start = input_files_start_end[input_files[i]][0]
+                needed = start - last_end
+                if needed > 0:
+                    sfname = os.path.join(temp_dir, f"silence_{i}.mp3")
+                    silence_gen(sfname, needed)
+                    f.write(f"file '{sfname}'\n")
+                f.write(f"file '{input_files[i]}'\n")
+                last_end = input_files_start_end[input_files[i]][1]
 
-            ffmpeg_opts.append("-filter_complex")
-            ffmpeg_opts.append(filter_complex)
-            ffmpeg_opts.append("-map")
-            ffmpeg_opts.append("[aout]")
+            x = get_duration(input_files[-1])
+            y = input_files_start_end[input_files[i]][0] + x
+            needed = max_duration - y
+            if needed > 0:
+                sfname = os.path.join(temp_dir, "silence_final.mp3")
+                silence_gen(sfname, needed)
+                f.write(f"file '{sfname}'\n")
 
-            temporary_file2 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-            try:
-                print("Concatenating...")
-                process = subprocess.call(
-                    ["ffmpeg", "-y", "-i", mother_temp_file.name]
-                    + ffmpeg_opts
-                    + [temporary_file2.name],
-                    # stdout=subprocess.DEVNULL,
-                    # stderr=subprocess.DEVNULL,
-                )
-                if process != 0:
-                    raise Exception("ffmpeg failed")
-            finally:
-                temporary_file2.close()
-                mother_temp_file.close()
-                shutil.move(temporary_file2.name, mother_temp_file.name)
-    finally:
-        mother_temp_file.close()
-        shutil.move(mother_temp_file.name, out_file)
+            f.flush()
+            process = subprocess.call(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    f.name,
+                    "-c",
+                    "copy",
+                    out_file,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if process != 0:
+                raise Exception("ffmpeg failed")
     print("Done")
 
 
