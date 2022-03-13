@@ -13,7 +13,9 @@ import edge_tts
 import pysrt
 
 logger = logging.getLogger(__name__)
-FORMAT = "[%(asctime)s %(filename)s->%(funcName)s():%(lineno)s]%(levelname)s: %(message)s"
+FORMAT = (
+    "[%(asctime)s %(filename)s->%(funcName)s():%(lineno)s]%(levelname)s: %(message)s"
+)
 logging.basicConfig(format=FORMAT)
 
 if shutil.which("ffmpeg") is None:
@@ -104,18 +106,40 @@ async def audio_gen(queue):
     file_length = 0
     communicate = edge_tts.Communicate()
     arg = await queue.get()
-    fname, duration = arg['fname'], arg['duration']
+    fname, text, duration, enhanced_srt = (
+        arg["fname"],
+        arg["text"],
+        arg["duration"],
+        arg["enhanced_srt"],
+    )
+
+    if enhanced_srt:
+        text_ = text.split("\n")[-1]
+        if text_.startswith("edge_tts{") and text_.endswith("}"):
+            try:
+                text_ = text_[len("edge_tts{") : -len("}")]
+                text_ = text_.split(",")
+                text_ = {k: v for k, v in [x.split(":") for x in text_]}
+                for x in text_.keys():
+                    if x not in ["rate", "pitch", "volume", "voice"]:
+                        raise Exception("edge_tts{} is invalid")
+                for k, v in text_.items():
+                    arg[k] = v
+            except ValueError as e:
+                text_ = {}
+            text = "\n".join(text.split("\n")[:-1])
+
     with open(fname, "wb") as f:
         while True:
             logger.debug(f"Generating {fname}...")
             try:
                 async for j in communicate.run(
-                    " ".join(arg["text"].split("\n")),
+                    " ".join(text.split("\n")),
                     codec="audio-24khz-48kbitrate-mono-mp3",
                     pitch=arg["pitch"],
                     rate=arg["rate"],
                     volume=arg["volume"],
-                    voice=arg["voice_name"],
+                    voice=arg["voice"],
                     boundary_type=1,
                 ):
                     if j[2] is not None:
@@ -148,9 +172,9 @@ async def audio_gen(queue):
     logger.debug(f"Generated {fname}")
 
 
-async def _main(srt_data, voice_name, out_file, pitch, rate, volume, batch_size):
-    communicate = edge_tts.Communicate()
-
+async def _main(
+    srt_data, voice, out_file, pitch, rate, volume, batch_size, enhanced_srt
+):
     max_duration = pysrttime_to_seconds(srt_data[-1].end)
 
     input_files = []
@@ -174,13 +198,13 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume, batch_size)
             args.append(
                 {
                     "fname": fname,
-                    "communicate": communicate,
                     "text": srt_data[i].text,
                     "pitch": pitch,
                     "rate": rate,
                     "volume": volume,
-                    "voice_name": voice_name,
+                    "voice": voice,
                     "duration": duration,
+                    "enhanced_srt": enhanced_srt,
                 }
             )
         args_len = len(args)
@@ -252,15 +276,21 @@ def main():
     parser.add_argument("--default-pitch", help="default pitch", default="+0Hz")
     parser.add_argument("--default-volume", help="default volume", default="+0%")
     parser.add_argument("--disable-debug", help="disable debug", action="store_true")
+    parser.add_argument(
+        "--disable-enhanced-srt",
+        help="disable edge-tts specific customizations",
+        action="store_true",
+    )
     args = parser.parse_args()
 
     srt_data = parse_srt(args.srt_file)
-    voice_name = args.voice
+    voice = args.voice
     out_file = args.out_file
     speed = args.default_speed
     pitch = args.default_pitch
     volume = args.default_volume
     batch_size = int(args.parallel_batch_size)
+    enhanced_srt = not args.disable_enhanced_srt
     if batch_size < 1:
         raise Exception("parallel-batch-size must be greater than 0")
 
@@ -270,12 +300,13 @@ def main():
     asyncio.get_event_loop().run_until_complete(
         _main(
             srt_data=srt_data,
-            voice_name=voice_name,
+            voice=voice,
             out_file=out_file,
             rate=speed,
             pitch=pitch,
             volume=volume,
             batch_size=batch_size,
+            enhanced_srt=enhanced_srt,
         )
     )
 
