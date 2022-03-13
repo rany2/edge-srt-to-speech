@@ -12,6 +12,10 @@ import tempfile
 import edge_tts
 import pysrt
 
+logger = logging.getLogger(__name__)
+FORMAT = "[%(asctime)s %(filename)s->%(funcName)s():%(lineno)s]%(levelname)s: %(message)s"
+logging.basicConfig(format=FORMAT)
+
 if shutil.which("ffmpeg") is None:
     print("ffmpeg is not installed")
     exit(1)
@@ -74,7 +78,7 @@ def ensure_audio_length(in_file, out_file, length):
 
 
 def silence_gen(out_file, duration):
-    logging.debug(f"Generating {out_file}...")
+    logger.debug(f"Generating silence {out_file}...")
     process = subprocess.call(
         [
             "ffmpeg",
@@ -92,45 +96,56 @@ def silence_gen(out_file, duration):
     )
     if process != 0:
         raise Exception("ffmpeg failed")
-    logging.debug(f"Generated {out_file}")
+    logger.debug(f"Generated silence {out_file}")
 
 
-async def audio_gen(
-    fname, communicate, text, pitch, rate, volume, voice_name, duration
-):
+async def audio_gen(queue):
     retry_count = 0
+    file_length = 0
+    communicate = edge_tts.Communicate()
+    arg = await queue.get()
+    fname, duration = arg['fname'], arg['duration']
     with open(fname, "wb") as f:
         while True:
-            logging.debug(f"Generating {fname}...")
-            async for j in communicate.run(
-                " ".join(text.split("\n")),
-                codec="audio-24khz-48kbitrate-mono-mp3",
-                pitch=pitch,
-                rate=rate,
-                volume=volume,
-                voice=voice_name,
-                boundary_type=1,
-            ):
-                if j[2] is not None:
-                    f.write(j[2])
-            if f.tell() == 0:
+            logger.debug(f"Generating {fname}...")
+            try:
+                async for j in communicate.run(
+                    " ".join(arg["text"].split("\n")),
+                    codec="audio-24khz-48kbitrate-mono-mp3",
+                    pitch=arg["pitch"],
+                    rate=arg["rate"],
+                    volume=arg["volume"],
+                    voice=arg["voice_name"],
+                    boundary_type=1,
+                ):
+                    if j[2] is not None:
+                        f.write(j[2])
+            except Exception:
                 if retry_count > 5:
                     raise Exception(f"Too many retries for {fname}")
                 else:
                     retry_count += 1
-                    logging.debug(f"Retrying {fname}...")
+                    f.seek(0)
+                    f.truncate()
+                    logger.debug(f"Retrying {fname}...")
                     await asyncio.sleep(retry_count + random.randint(1, 5))
             else:
+                file_length = f.tell()
                 break
 
-    temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    try:
-        ensure_audio_length(fname, temporary_file.name, duration)
-    finally:
-        temporary_file.close()
-        shutil.move(temporary_file.name, fname)
+    if file_length > 0:
+        temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        try:
+            ensure_audio_length(fname, temporary_file.name, duration)
+        finally:
+            temporary_file.close()
+            shutil.move(temporary_file.name, fname)
+    else:
+        silence_gen(fname, duration)
 
-    logging.debug(f"Generated {fname}")
+    queue.task_done()
+
+    logger.debug(f"Generated {fname}")
 
 
 async def _main(srt_data, voice_name, out_file, pitch, rate, volume, batch_size):
@@ -142,9 +157,10 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume, batch_size)
     input_files_start_end = {}
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        coros = []
+        args = []
+        queue = asyncio.Queue()
         for i in range(len(srt_data)):
-            logging.debug(f"Preparing {i}...")
+            logger.debug(f"Preparing {i}...")
 
             fname = os.path.join(temp_dir, f"{i}.mp3")
             input_files.append(fname)
@@ -155,30 +171,34 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume, batch_size)
             input_files_start_end[fname] = (start, end)
 
             duration = pysrttime_to_seconds(srt_data[i].duration)
-            coros.append(
-                audio_gen(
-                    fname=fname,
-                    communicate=communicate,
-                    text=srt_data[i].text,
-                    pitch=pitch,
-                    rate=rate,
-                    volume=volume,
-                    voice_name=voice_name,
-                    duration=duration,
-                )
+            args.append(
+                {
+                    "fname": fname,
+                    "communicate": communicate,
+                    "text": srt_data[i].text,
+                    "pitch": pitch,
+                    "rate": rate,
+                    "volume": volume,
+                    "voice_name": voice_name,
+                    "duration": duration,
+                }
             )
-        coros_len = len(coros)
-        for i in range(0, coros_len, batch_size):
-            await asyncio.gather(*coros[i : i + batch_size])
+        args_len = len(args)
+        for i in range(0, args_len, batch_size):
+            tasks = []
+            for j in range(i, min(i + batch_size, args_len)):
+                tasks.append(audio_gen(queue))
+                await queue.put(args[j])
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        logging.debug("Generating silence and joining...")
+        logger.debug("Generating silence and joining...")
         f = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
         try:
             last_end = 0
             for i in range(len(input_files)):
                 start = input_files_start_end[input_files[i]][0]
                 needed = start - last_end
-                logging.debug(f"Needed {needed} seconds for {i}")
+                logger.debug(f"Needed {needed} seconds for {i}")
                 if needed > 0.0001:
                     sfname = os.path.join(temp_dir, f"silence_{i}.mp3")
                     silence_gen(sfname, needed)
@@ -219,7 +239,7 @@ async def _main(srt_data, voice_name, out_file, pitch, rate, volume, batch_size)
         finally:
             f.close()
             os.remove(f.name)
-    logging.debug(f"Completed {out_file}")
+    logger.debug(f"Completed {out_file}")
 
 
 def main():
@@ -227,7 +247,7 @@ def main():
     parser.add_argument("srt_file", help="srt file to convert")
     parser.add_argument("out_file", help="output file")
     parser.add_argument("--voice", help="voice name", default="en-US-SaraNeural")
-    parser.add_argument("--parallel-batch-size", help="request batch size", default=100)
+    parser.add_argument("--parallel-batch-size", help="request batch size", default=50)
     parser.add_argument("--default-speed", help="default speed", default="+0%")
     parser.add_argument("--default-pitch", help="default pitch", default="+0Hz")
     parser.add_argument("--default-volume", help="default volume", default="+0%")
@@ -245,7 +265,7 @@ def main():
         raise Exception("parallel-batch-size must be greater than 0")
 
     if not args.disable_debug:
-        logging.basicConfig(level=logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
 
     asyncio.get_event_loop().run_until_complete(
         _main(
