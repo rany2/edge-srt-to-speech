@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import edge_tts
@@ -21,17 +22,16 @@ FORMAT = (
 logging.basicConfig(format=FORMAT)
 
 if shutil.which("ffmpeg") is None:
-    print("ffmpeg is not installed")
-    exit(1)
+    print("ffmpeg is not installed", file=sys.stderr)
+    sys.exit(1)
 
 if shutil.which("ffprobe") is None:
-    print("ffprobe (part of ffmpeg) is not installed")
-    exit(1)
+    print("ffprobe (part of ffmpeg) is not installed", file=sys.stderr)
+    sys.exit(1)
 
 
 def parse_srt(srt_file):
-    subs = pysrt.open(srt_file)
-    return subs
+    return pysrt.open(srt_file)
 
 
 def pysrttime_to_seconds(t):
@@ -39,10 +39,9 @@ def pysrttime_to_seconds(t):
 
 
 def get_ssml_variables(text):
-    result = re.findall("{[^}\s]+}", text)
+    result = re.findall(r"{[^}\s]+}", text)
     result = [x[1:-1] for x in result]
-    result = list(dict.fromkeys(result))
-    return result
+    return list(dict.fromkeys(result))
 
 
 def gen_from_template(text, variables):
@@ -75,7 +74,7 @@ def ensure_audio_length(in_file, out_file, length):
     elif atempo > 100:
         atempo = 100
     if atempo > 1:
-        process = subprocess.call(
+        retcode = subprocess.call(
             [
                 "ffmpeg",
                 "-y",
@@ -88,22 +87,22 @@ def ensure_audio_length(in_file, out_file, length):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        if process != 0:
-            raise Exception("ffmpeg failed")
+        if retcode != 0:
+            raise subprocess.CalledProcessError(retcode, "ffmpeg")
     else:
         shutil.copyfile(in_file, out_file)
 
 
 def silence_gen(out_file, duration):
-    logger.debug(f"Generating silence {out_file}...")
-    process = subprocess.call(
+    logger.debug("Generating silence %s...", out_file)
+    retcode = subprocess.call(
         [
             "ffmpeg",
             "-y",
             "-f",
             "lavfi",
             "-i",
-            f"anullsrc=cl=mono:r=24000",
+            "anullsrc=cl=mono:r=24000",
             "-t",
             str(duration),
             out_file,
@@ -111,9 +110,24 @@ def silence_gen(out_file, duration):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    if process != 0:
-        raise Exception("ffmpeg failed")
-    logger.debug(f"Generated silence {out_file}")
+    if retcode != 0:
+        raise subprocess.CalledProcessError(retcode, "ffmpeg")
+    logger.debug("Generated silence %s", out_file)
+
+
+def get_enhanced_srt_params(text, arg, ssml_variables):
+    text_ = text.split("\n")[-1]
+    if text_.startswith("edge_tts{") and text_.endswith("}"):
+        text_ = text_[len("edge_tts{") : -len("}")]
+        text_ = text_.split(",")
+        text_ = dict([x.split(":") for x in text_])
+        for x in text_.keys():
+            if x not in ["rate", "pitch", "volume", "voice"] + ssml_variables:
+                raise ValueError("edge_tts{} is invalid")
+        for k, v in text_.items():
+            arg[k] = v
+        return arg, "\n".join(text.split("\n")[:-1])
+    return arg, text
 
 
 async def audio_gen(queue, ssml_template, ssml_variables):
@@ -129,20 +143,7 @@ async def audio_gen(queue, ssml_template, ssml_variables):
     )
 
     if enhanced_srt:
-        text_ = text.split("\n")[-1]
-        if text_.startswith("edge_tts{") and text_.endswith("}"):
-            try:
-                text_ = text_[len("edge_tts{") : -len("}")]
-                text_ = text_.split(",")
-                text_ = {k: v for k, v in [x.split(":") for x in text_]}
-                for x in text_.keys():
-                    if x not in ["rate", "pitch", "volume", "voice"] + ssml_variables:
-                        raise Exception("edge_tts{} is invalid")
-                for k, v in text_.items():
-                    arg[k] = v
-            except ValueError as e:
-                text_ = {}
-            text = "\n".join(text.split("\n")[:-1])
+        arg, text = get_enhanced_srt_params(text, arg, ssml_variables)
     text = " ".join(text.split("\n"))
 
     if ssml_template:
@@ -151,7 +152,7 @@ async def audio_gen(queue, ssml_template, ssml_variables):
 
     with open(fname, "wb") as f:
         while True:
-            logger.debug(f"Generating {fname}...")
+            logger.debug("Generating %s...", fname)
             try:
                 async for j in communicate.run(
                     text,
@@ -161,19 +162,18 @@ async def audio_gen(queue, ssml_template, ssml_variables):
                     volume=arg["volume"],
                     voice=arg["voice"],
                     boundary_type=1,
-                    customspeak=ssml_template,
+                    customspeak=bool(ssml_template),
                 ):
                     if j[2] is not None:
                         f.write(j[2])
-            except Exception:
+            except Exception as e:
                 if retry_count > 5:
-                    raise Exception(f"Too many retries for {fname}")
-                else:
-                    retry_count += 1
-                    f.seek(0)
-                    f.truncate()
-                    logger.debug(f"Retrying {fname}...")
-                    await asyncio.sleep(retry_count + random.randint(1, 5))
+                    raise Exception(f"Too many retries for {fname}") from e
+                retry_count += 1
+                f.seek(0)
+                f.truncate()
+                logger.debug("Retrying %s...", fname)
+                await asyncio.sleep(retry_count + random.randint(1, 5))
             else:
                 file_length = f.tell()
                 break
@@ -190,7 +190,7 @@ async def audio_gen(queue, ssml_template, ssml_variables):
 
     queue.task_done()
 
-    logger.debug(f"Generated {fname}")
+    logger.debug("Generated %s", fname)
 
 
 async def _main(
@@ -216,22 +216,22 @@ async def _main(
     with tempfile.TemporaryDirectory() as temp_dir:
         args = []
         queue = asyncio.Queue()
-        for i in range(len(srt_data)):
-            logger.debug(f"Preparing {i}...")
+        for i, j in enumerate(srt_data):
+            logger.debug("Preparing %s...", i)
 
             fname = os.path.join(temp_dir, f"{i}.mp3")
             input_files.append(fname)
 
-            start = pysrttime_to_seconds(srt_data[i].start)
-            end = pysrttime_to_seconds(srt_data[i].end)
+            start = pysrttime_to_seconds(j.start)
+            end = pysrttime_to_seconds(j.end)
 
             input_files_start_end[fname] = (start, end)
 
-            duration = pysrttime_to_seconds(srt_data[i].duration)
+            duration = pysrttime_to_seconds(j.duration)
             args.append(
                 {
                     "fname": fname,
-                    "text": srt_data[i].text,
+                    "text": j.text,
                     "pitch": pitch,
                     "rate": rate,
                     "volume": volume,
@@ -267,17 +267,17 @@ async def _main(
             pdbar = None
         try:
             last_end = 0
-            for i in range(len(input_files)):
-                start = input_files_start_end[input_files[i]][0]
+            for i, j in enumerate(input_files):
+                start = input_files_start_end[j][0]
                 needed = start - last_end
-                logger.debug(f"Needed {needed} seconds for {i}")
+                logger.debug("Needed %f seconds for %s", needed, i)
                 if needed > 0.0001:
                     sfname = os.path.join(temp_dir, f"silence_{i}.mp3")
                     silence_gen(sfname, needed)
                     f.write(f"file '{sfname}'\n")
                     last_end += get_duration(sfname)
-                f.write(f"file '{input_files[i]}'\n")
-                last_end += get_duration(input_files[i])
+                f.write(f"file '{j}'\n")
+                last_end += get_duration(j)
                 if pdbar is not None:
                     pdbar.update()
 
@@ -291,7 +291,7 @@ async def _main(
             f.flush()
             f.close()
 
-            process = subprocess.call(
+            retcode = subprocess.call(
                 [
                     "ffmpeg",
                     "-y",
@@ -308,14 +308,14 @@ async def _main(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            if process != 0:
-                raise Exception("ffmpeg failed")
+            if retcode != 0:
+                raise subprocess.CalledProcessError(retcode, "ffmpeg")
         finally:
             f.close()
             os.remove(f.name)
             if pdbar is not None:
                 pdbar.close()
-    logger.debug(f"Completed {out_file}")
+    logger.debug("Completed %s", out_file)
 
 
 def main():
@@ -349,8 +349,10 @@ def main():
     batch_size = int(args.parallel_batch_size)
     enhanced_srt = not args.disable_enhanced_srt
     if args.ssml_template is not None:
-        with open(args.ssml_template, "r") as f:
+        with open(args.ssml_template, "r", encoding="utf-8") as f:
             ssml_template = f.read()
+    else:
+        ssml_template = None
     ssml_default_variables = args.ssml_default_variables
     if batch_size < 1:
         raise Exception("parallel-batch-size must be greater than 0")
@@ -360,9 +362,7 @@ def main():
 
     if ssml_default_variables:
         ssml_default_variables = ssml_default_variables.split(",")
-        ssml_default_variables = {
-            k: v for k, v in [x.split(":") for x in ssml_default_variables]
-        }
+        ssml_default_variables = dict([x.split(":") for x in ssml_default_variables])
 
     asyncio.get_event_loop().run_until_complete(
         _main(

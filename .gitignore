@@ -6,3 +6,6 @@ src/*.egg-info/**
 
 build/
 build/**
+
+testing/
+testing/**
