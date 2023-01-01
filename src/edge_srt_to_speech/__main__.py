@@ -5,7 +5,6 @@ import asyncio
 import logging
 import os
 import random
-import re
 import shutil
 import subprocess
 import sys
@@ -21,33 +20,18 @@ FORMAT = (
 )
 logging.basicConfig(format=FORMAT)
 
-if shutil.which("ffmpeg") is None:
-    print("ffmpeg is not installed", file=sys.stderr)
-    sys.exit(1)
+def dep_check():
+    if not shutil.which("ffmpeg"):
+        print("ffmpeg is not installed", file=sys.stderr)
+        sys.exit(1)
 
-if shutil.which("ffprobe") is None:
-    print("ffprobe (part of ffmpeg) is not installed", file=sys.stderr)
-    sys.exit(1)
-
-
-def parse_srt(srt_file):
-    return pysrt.open(srt_file)
+    if not shutil.which("ffprobe"):
+        print("ffprobe (part of ffmpeg) is not installed", file=sys.stderr)
+        sys.exit(1)
 
 
 def pysrttime_to_seconds(t):
     return (t.hours * 60 + t.minutes) * 60 + t.seconds + t.milliseconds / 1000
-
-
-def get_ssml_variables(text):
-    result = re.findall(r"{[^}\s]+}", text)
-    result = [x[1:-1] for x in result]
-    return list(dict.fromkeys(result))
-
-
-def gen_from_template(text, variables):
-    for k, v in variables.items():
-        text = text.replace(f"{{{k}}}", str(v))
-    return text
 
 
 def get_duration(in_file):
@@ -115,14 +99,14 @@ def silence_gen(out_file, duration):
     logger.debug("Generated silence %s", out_file)
 
 
-def get_enhanced_srt_params(text, arg, ssml_variables):
+def get_enhanced_srt_params(text, arg):
     text_ = text.split("\n")[-1]
     if text_.startswith("edge_tts{") and text_.endswith("}"):
         text_ = text_[len("edge_tts{") : -len("}")]
         text_ = text_.split(",")
         text_ = dict([x.split(":") for x in text_])
         for x in text_.keys():
-            if x not in ["rate", "pitch", "volume", "voice"] + ssml_variables:
+            if x not in ["rate", "pitch", "volume", "voice"]:
                 raise ValueError("edge_tts{} is invalid")
         for k, v in text_.items():
             arg[k] = v
@@ -130,7 +114,7 @@ def get_enhanced_srt_params(text, arg, ssml_variables):
     return arg, text
 
 
-async def audio_gen(queue, ssml_template, ssml_variables):
+async def audio_gen(queue):
     retry_count = 0
     file_length = 0
     communicate = edge_tts.Communicate()
@@ -143,12 +127,8 @@ async def audio_gen(queue, ssml_template, ssml_variables):
     )
 
     if enhanced_srt:
-        arg, text = get_enhanced_srt_params(text, arg, ssml_variables)
+        arg, text = get_enhanced_srt_params(text, arg)
     text = " ".join(text.split("\n"))
-
-    if ssml_template:
-        arg["text"] = text
-        text = gen_from_template(ssml_template, arg)
 
     with open(fname, "wb") as f:
         while True:
@@ -162,7 +142,6 @@ async def audio_gen(queue, ssml_template, ssml_variables):
                     volume=arg["volume"],
                     voice=arg["voice"],
                     boundary_type=1,
-                    customspeak=bool(ssml_template),
                 ):
                     if j[2] is not None:
                         f.write(j[2])
@@ -202,16 +181,11 @@ async def _main(
     volume,
     batch_size,
     enhanced_srt,
-    ssml_template,
-    ssml_default_variables,
 ):
     max_duration = pysrttime_to_seconds(srt_data[-1].end)
 
     input_files = []
     input_files_start_end = {}
-
-    custom_ssml = ssml_template is not None
-    ssml_variables = get_ssml_variables(ssml_template) if custom_ssml else []
 
     with tempfile.TemporaryDirectory() as temp_dir:
         args = []
@@ -240,8 +214,6 @@ async def _main(
                     "enhanced_srt": enhanced_srt,
                 }
             )
-            if ssml_default_variables:
-                args[-1].update(ssml_default_variables)
         args_len = len(args)
         if logger.getEffectiveLevel() != logging.DEBUG:
             pdbar = tqdm.tqdm(total=args_len, desc="Generating audio")
@@ -250,7 +222,7 @@ async def _main(
         for i in range(0, args_len, batch_size):
             tasks = []
             for j in range(i, min(i + batch_size, args_len)):
-                tasks.append(audio_gen(queue, ssml_template, ssml_variables))
+                tasks.append(audio_gen(queue))
                 await queue.put(args[j])
             for f in asyncio.as_completed(tasks):
                 await f
@@ -319,15 +291,12 @@ async def _main(
 
 
 def main():
+    dep_check()
+
     parser = argparse.ArgumentParser(description="Converts srt to mp3 using edge-tts")
     parser.add_argument("srt_file", help="srt file to convert")
     parser.add_argument("out_file", help="output file")
-    parser.add_argument("--voice", help="voice name", default="en-US-SaraNeural")
-    parser.add_argument("--ssml-template", help="custom ssml template")
-    parser.add_argument(
-        "--ssml-default-variables",
-        help="default variables for variables in ssml template",
-    )
+    parser.add_argument("--voice", help="voice name", default="en-US-AriaNeural")
     parser.add_argument("--parallel-batch-size", help="request batch size", default=50)
     parser.add_argument("--default-speed", help="default speed", default="+0%")
     parser.add_argument("--default-pitch", help="default pitch", default="+0Hz")
@@ -340,7 +309,7 @@ def main():
     )
     args = parser.parse_args()
 
-    srt_data = parse_srt(args.srt_file)
+    srt_data = pysrt.open(args.srt_file)
     voice = args.voice
     out_file = args.out_file
     speed = args.default_speed
@@ -348,21 +317,11 @@ def main():
     volume = args.default_volume
     batch_size = int(args.parallel_batch_size)
     enhanced_srt = not args.disable_enhanced_srt
-    if args.ssml_template is not None:
-        with open(args.ssml_template, "r", encoding="utf-8") as f:
-            ssml_template = f.read()
-    else:
-        ssml_template = None
-    ssml_default_variables = args.ssml_default_variables
     if batch_size < 1:
         raise Exception("parallel-batch-size must be greater than 0")
 
     if args.enable_debug:
         logger.setLevel(logging.DEBUG)
-
-    if ssml_default_variables:
-        ssml_default_variables = ssml_default_variables.split(",")
-        ssml_default_variables = dict([x.split(":") for x in ssml_default_variables])
 
     asyncio.get_event_loop().run_until_complete(
         _main(
@@ -374,8 +333,6 @@ def main():
             volume=volume,
             batch_size=batch_size,
             enhanced_srt=enhanced_srt,
-            ssml_template=ssml_template,
-            ssml_default_variables=ssml_default_variables,
         )
     )
 
