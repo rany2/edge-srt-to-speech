@@ -20,6 +20,7 @@ FORMAT = (
 )
 logging.basicConfig(format=FORMAT)
 
+
 def dep_check():
     if not shutil.which("ffmpeg"):
         print("ffmpeg is not installed", file=sys.stderr)
@@ -117,7 +118,6 @@ def get_enhanced_srt_params(text, arg):
 async def audio_gen(queue):
     retry_count = 0
     file_length = 0
-    communicate = edge_tts.Communicate()
     arg = await queue.get()
     fname, text, duration, enhanced_srt = (
         arg["fname"],
@@ -130,32 +130,26 @@ async def audio_gen(queue):
         arg, text = get_enhanced_srt_params(text, arg)
     text = " ".join(text.split("\n"))
 
-    with open(fname, "wb") as f:
-        while True:
-            logger.debug("Generating %s...", fname)
-            try:
-                async for j in communicate.run(
-                    text,
-                    codec="audio-24khz-48kbitrate-mono-mp3",
-                    pitch=arg["pitch"],
-                    rate=arg["rate"],
-                    volume=arg["volume"],
-                    voice=arg["voice"],
-                    boundary_type=1,
-                ):
-                    if j[2] is not None:
-                        f.write(j[2])
-            except Exception as e:
-                if retry_count > 5:
-                    raise Exception(f"Too many retries for {fname}") from e
-                retry_count += 1
-                f.seek(0)
-                f.truncate()
-                logger.debug("Retrying %s...", fname)
-                await asyncio.sleep(retry_count + random.randint(1, 5))
-            else:
-                file_length = f.tell()
-                break
+    while True:
+        logger.debug("Generating %s...", fname)
+        try:
+            communicate = edge_tts.Communicate(
+                text,
+                pitch=arg["pitch"],
+                rate=arg["rate"],
+                volume=arg["volume"],
+                voice=arg["voice"],
+            )
+            await communicate.save(fname)
+        except Exception as e:
+            if retry_count > 5:
+                raise Exception(f"Too many retries for {fname}") from e
+            retry_count += 1
+            logger.debug("Retrying %s...", fname)
+            await asyncio.sleep(retry_count + random.randint(1, 5))
+        else:
+            file_length = os.path.getsize(fname)
+            break
 
     if file_length > 0:
         temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
@@ -182,6 +176,9 @@ async def _main(
     batch_size,
     enhanced_srt,
 ):
+    if not srt_data or len(srt_data) == 0:
+        raise ValueError("srt_data is empty")
+
     max_duration = pysrttime_to_seconds(srt_data[-1].end)
 
     input_files = []

@@ -1,2 +1,2 @@
-find src -name '*.py' | xargs black
-find src -name '*.py' | xargs isort
+find src -name '*.py' | xargs pylint
+find src -name '*.py' | xargs mypy
