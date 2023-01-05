@@ -107,7 +107,7 @@ def get_enhanced_srt_params(text, arg):
         text_ = text_.split(",")
         text_ = dict([x.split(":") for x in text_])
         for x in text_.keys():
-            if x not in ["rate", "pitch", "volume", "voice"]:
+            if x not in ["rate", "volume", "voice"]:
                 raise ValueError("edge_tts{} is invalid")
         for k, v in text_.items():
             arg[k] = v
@@ -135,7 +135,6 @@ async def audio_gen(queue):
         try:
             communicate = edge_tts.Communicate(
                 text,
-                pitch=arg["pitch"],
                 rate=arg["rate"],
                 volume=arg["volume"],
                 voice=arg["voice"],
@@ -170,7 +169,6 @@ async def _main(
     srt_data,
     voice,
     out_file,
-    pitch,
     rate,
     volume,
     batch_size,
@@ -203,7 +201,6 @@ async def _main(
                 {
                     "fname": fname,
                     "text": j.text,
-                    "pitch": pitch,
                     "rate": rate,
                     "volume": volume,
                     "voice": voice,
@@ -296,7 +293,6 @@ def main():
     parser.add_argument("--voice", help="voice name", default="en-US-AriaNeural")
     parser.add_argument("--parallel-batch-size", help="request batch size", default=50)
     parser.add_argument("--default-speed", help="default speed", default="+0%")
-    parser.add_argument("--default-pitch", help="default pitch", default="+0Hz")
     parser.add_argument("--default-volume", help="default volume", default="+0%")
     parser.add_argument("--enable-debug", help="enable debug", action="store_true")
     parser.add_argument(
@@ -310,7 +306,6 @@ def main():
     voice = args.voice
     out_file = args.out_file
     speed = args.default_speed
-    pitch = args.default_pitch
     volume = args.default_volume
     batch_size = int(args.parallel_batch_size)
     enhanced_srt = not args.disable_enhanced_srt
@@ -326,7 +321,6 @@ def main():
             voice=voice,
             out_file=out_file,
             rate=speed,
-            pitch=pitch,
             volume=volume,
             batch_size=batch_size,
             enhanced_srt=enhanced_srt,
