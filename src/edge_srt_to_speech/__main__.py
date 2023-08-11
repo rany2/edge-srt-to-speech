@@ -117,6 +117,7 @@ def get_enhanced_srt_params(text, arg):
 
 async def audio_gen(queue):
     retry_count = 0
+    retry_limit = 5
     file_length = 0
     arg = await queue.get()
     fname, text, duration, enhanced_srt = (
@@ -140,15 +141,19 @@ async def audio_gen(queue):
                 voice=arg["voice"],
             )
             await communicate.save(fname)
+        except edge_tts.exceptions.NoAudioReceived:
+            with open(fname, "wb") as fobj:
+                fobj.write(b"")
         except Exception as e:
-            if retry_count > 5:
+            if retry_count > retry_limit:
                 raise Exception(f"Too many retries for {fname}") from e
             retry_count += 1
             logger.debug("Retrying %s...", fname)
             await asyncio.sleep(retry_count + random.randint(1, 5))
-        else:
-            file_length = os.path.getsize(fname)
-            break
+            continue
+        break
+
+    file_length = os.path.getsize(fname)
 
     if file_length > 0:
         temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
