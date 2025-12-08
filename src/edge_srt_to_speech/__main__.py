@@ -212,6 +212,9 @@ async def audio_gen(queue):
             shutil.move(temporary_file.name, wav_fname)
         os.remove(mp3_fname)
     else:
+        # Remove empty mp3 file
+        if os.path.exists(mp3_fname):
+            os.remove(mp3_fname)
         silence_gen(wav_fname, duration)
 
     queue.task_done()
