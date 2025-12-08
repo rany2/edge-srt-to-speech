@@ -342,10 +342,11 @@ async def _main(
                 raise subprocess.CalledProcessError(retcode, "ffmpeg")
 
             wav_to_mp3(temp_wav, out_file)
-            os.remove(temp_wav)
         finally:
             f.close()
             os.remove(f.name)
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
             if pdbar is not None:
                 pdbar.close()
     logger.debug("Completed %s", out_file)
