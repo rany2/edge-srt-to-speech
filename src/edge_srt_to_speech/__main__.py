@@ -67,6 +67,8 @@ def ensure_audio_length(in_file, out_file, length):
                 in_file,
                 "-filter:a",
                 f"atempo={atempo}",
+                "-f",
+                "wav",
                 out_file,
             ],
             stdout=subprocess.DEVNULL,
@@ -76,6 +78,44 @@ def ensure_audio_length(in_file, out_file, length):
             raise subprocess.CalledProcessError(retcode, "ffmpeg")
     else:
         shutil.copyfile(in_file, out_file)
+
+
+def mp3_to_wav(mp3_file, wav_file):
+    """Convert MP3 file to WAV format"""
+    retcode = subprocess.call(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            mp3_file,
+            "-f",
+            "wav",
+            wav_file,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if retcode != 0:
+        raise subprocess.CalledProcessError(retcode, "ffmpeg")
+
+
+def wav_to_mp3(wav_file, mp3_file):
+    """Convert WAV file to MP3 format"""
+    retcode = subprocess.call(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            wav_file,
+            "-c:a",
+            "libmp3lame",
+            mp3_file,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if retcode != 0:
+        raise subprocess.CalledProcessError(retcode, "ffmpeg")
 
 
 def silence_gen(out_file, duration):
@@ -90,6 +130,8 @@ def silence_gen(out_file, duration):
             "anullsrc=cl=mono:r=24000",
             "-t",
             str(duration),
+            "-f",
+            "wav",
             out_file,
         ],
         stdout=subprocess.DEVNULL,
@@ -131,8 +173,12 @@ async def audio_gen(queue):
         arg, text = get_enhanced_srt_params(text, arg)
     text = " ".join(text.split("\n"))
 
+    # Generate mp3 with edge-tts
+    mp3_fname = fname
+    wav_fname = fname.replace(".mp3", ".wav")
+
     while True:
-        logger.debug("Generating %s...", fname)
+        logger.debug("Generating %s...", mp3_fname)
         try:
             communicate = edge_tts.Communicate(
                 text,
@@ -140,34 +186,37 @@ async def audio_gen(queue):
                 volume=arg["volume"],
                 voice=arg["voice"],
             )
-            await communicate.save(fname)
+            await communicate.save(mp3_fname)
         except edge_tts.exceptions.NoAudioReceived:
-            with open(fname, "wb") as fobj:
+            with open(mp3_fname, "wb") as fobj:
                 fobj.write(b"")
         except Exception as e:
             if retry_count > retry_limit:
-                raise Exception(f"Too many retries for {fname}") from e
+                raise Exception(f"Too many retries for {mp3_fname}") from e
             retry_count += 1
-            logger.debug("Retrying %s...", fname)
+            logger.debug("Retrying %s...", mp3_fname)
             await asyncio.sleep(retry_count + random.randint(1, 5))
             continue
         break
 
-    file_length = os.path.getsize(fname)
+    file_length = os.path.getsize(mp3_fname)
 
     if file_length > 0:
-        temporary_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        mp3_to_wav(mp3_fname, wav_fname)
+        # ensure length using wav
+        temporary_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         try:
-            ensure_audio_length(fname, temporary_file.name, duration)
+            ensure_audio_length(wav_fname, temporary_file.name, duration)
         finally:
             temporary_file.close()
-            shutil.move(temporary_file.name, fname)
+            shutil.move(temporary_file.name, wav_fname)
+        os.remove(mp3_fname)
     else:
-        silence_gen(fname, duration)
+        silence_gen(wav_fname, duration)
 
     queue.task_done()
 
-    logger.debug("Generated %s", fname)
+    logger.debug("Generated %s", wav_fname)
 
 
 async def _main(
@@ -239,29 +288,34 @@ async def _main(
         try:
             last_end = 0
             for i, j in enumerate(input_files):
+                wav_file = j.replace(".mp3", ".wav")
                 start = input_files_start_end[j][0]
                 needed = start - last_end
                 logger.debug("Needed %f seconds for %s", needed, i)
                 if needed > 0.0001:
-                    sfname = os.path.join(temp_dir, f"silence_{i}.mp3")
+                    sfname = os.path.join(temp_dir, f"silence_{i}.wav")
                     silence_gen(sfname, needed)
                     f.write(f"file '{sfname}'\n")
                     last_end += get_duration(sfname)
-                f.write(f"file '{j}'\n")
-                last_end += get_duration(j)
+                f.write(f"file '{wav_file}'\n")
+                last_end += get_duration(wav_file)
                 if pdbar is not None:
                     pdbar.update()
 
-            x = get_duration(input_files[-1])
-            y = input_files_start_end[input_files[i]][0] + x
+            last_file = input_files[-1]
+            last_wav_file = last_file.replace(".mp3", ".wav")
+            x = get_duration(last_wav_file)
+            y = input_files_start_end[last_file][0] + x
             needed = max_duration - y
             if needed > 0:
-                sfname = os.path.join(temp_dir, "silence_final.mp3")
+                sfname = os.path.join(temp_dir, "silence_final.wav")
                 silence_gen(sfname, needed)
                 f.write(f"file '{sfname}'\n")
             f.flush()
             f.close()
 
+            # Generate temporary WAV output
+            temp_wav = out_file + ".temp.wav"
             retcode = subprocess.call(
                 [
                     "ffmpeg",
@@ -274,13 +328,16 @@ async def _main(
                     f.name,
                     "-c",
                     "copy",
-                    out_file,
+                    temp_wav,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             if retcode != 0:
                 raise subprocess.CalledProcessError(retcode, "ffmpeg")
+
+            wav_to_mp3(temp_wav, out_file)
+            os.remove(temp_wav)
         finally:
             f.close()
             os.remove(f.name)
