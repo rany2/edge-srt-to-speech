@@ -202,6 +202,8 @@ async def audio_gen(queue):
     file_length = os.path.getsize(mp3_fname)
 
     if file_length > 0:
+        # Convert to WAV format for processing to avoid issues with MP3 concatenation
+        # (see issue #38). Edge-TTS outputs MP3, so we convert to WAV, process, and convert back.
         mp3_to_wav(mp3_fname, wav_fname)
         # ensure length using wav
         temporary_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
