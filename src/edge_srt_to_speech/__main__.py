@@ -383,7 +383,7 @@ def main():
     if args.enable_debug:
         logger.setLevel(logging.DEBUG)
 
-    asyncio.get_event_loop().run_until_complete(
+    asyncio.run(
         _main(
             srt_data=srt_data,
             voice=voice,
